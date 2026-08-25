@@ -5,12 +5,13 @@ import logging
 import re
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, RedirectResponse
 
 from app.domain.models import (
     ApiError,
@@ -68,7 +69,6 @@ def _model_json(model) -> str:
         return json.dumps(model.model_dump(exclude_none=True, exclude_defaults=True))
     return json.dumps(model.dict(exclude_none=True, exclude_defaults=True))
 
-
 def _sse(event: SearchStreamEvent) -> str:
     return f"event: {event.event}\ndata: {_model_json(event)}\n\n"
 
@@ -78,7 +78,7 @@ async def _search_event_stream(
     query: str,
     limit: int,
     offset: int,
-    device_id: str | None,
+    device_id: Optional[str],
 ) -> AsyncIterator[str]:
     async for event in manager.stream_search(selector, query, limit, offset, device_id):
         yield _sse(event)
@@ -139,11 +139,11 @@ async def sources() -> dict[str, object]:
 @app.get("/search")
 async def search(
     q: str = Query(..., min_length=1),
-    source: str | None = Query(default=None),
-    sources: str | None = Query(default=None),
+    source: Optional[str] = Query(default=None),
+    sources: Optional[str] = Query(default=None),
     limit: int = Query(default=10, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    device_id: str | None = Query(default=None),
+    device_id: Optional[str] = Query(default=None),
 ) -> StreamingResponse:
     selector = sources or source or "all"
     manager.prepare_search_request(selector, q, limit, offset)
@@ -158,13 +158,22 @@ async def search(
     "/stream/{result_id}",
     response_class=FileResponse,
 )
-async def stream(result_id: str) -> FileResponse:
-    return await _stream_result(result_id)
+async def stream(
+    result_id: str,
+    direct_url: bool = Query(default=False),
+):
+    return await _stream_result(result_id, direct_url=direct_url)
 
 
-async def _stream_result(result_id: str) -> FileResponse:
-    record, _ = await manager.prepare_cached_track(result_id)
+async def _stream_result(result_id: str, *, direct_url: bool):
+    record, _ = await manager.prepare_cached_track(result_id, direct_url=direct_url)
     file_name = _safe_file_name(record.title, record.artist)
+
+    # If file_path is a remote URL (starts with http), redirect to it
+    if record.file_path.startswith("http"):
+        return RedirectResponse(url=record.file_path)
+
+    # Otherwise, serve as a local file
     return FileResponse(
         record.file_path,
         media_type="audio/mpeg",
@@ -178,18 +187,26 @@ async def _stream_result(result_id: str) -> FileResponse:
 )
 async def download(
     result_id: str,
-    device_id: str | None = Query(default=None),
-) -> FileResponse:
-    return await _download_result(result_id, device_id)
+    device_id: Optional[str] = Query(default=None),
+    direct_url: bool = Query(default=False),
+):
+    return await _download_result(result_id, device_id, direct_url=direct_url)
 
 
-async def _download_result(result_id: str, device_id: str | None) -> FileResponse:
+async def _download_result(result_id: str, device_id: Optional[str], *, direct_url: bool):
     record, _ = await manager.prepare_cached_track(
         result_id,
         device_id=device_id,
         block_device_duplicate=True,
+        direct_url=direct_url,
     )
     file_name = _safe_file_name(record.title, record.artist)
+
+    # If file_path is a remote URL (starts with http), redirect to it
+    if record.file_path.startswith("http"):
+        return RedirectResponse(url=record.file_path)
+
+    # Otherwise, serve as a local file
     return FileResponse(
         record.file_path,
         media_type="audio/mpeg",
